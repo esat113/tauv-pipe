@@ -1,0 +1,6 @@
+cyclonedds==0.10.5
+numpy
+opencv-python-headless
+pyyaml
+requests
+flask

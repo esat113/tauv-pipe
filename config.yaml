@@ -1,0 +1,40 @@
+# tauv-pipe: Boru Takip Konfigurasyonu
+
+# --- Motor PWM Ayarlari ---
+neutral_pwm: 1500
+forward_pwm: 200              # duz gidiste ileri PWM offset
+max_yaw_pwm: 200              # yaw araligi: 1300 (sol) .. 1700 (sag)
+
+# --- PI Controller ---
+kp_yaw: 150.0                 # P kazanci
+ki_yaw: 200.0                 # I kazanci (sabit offset duzeltme)
+
+# --- Multi-Slice ---
+num_slices: 8
+slice_weights: [0.25, 0.20, 0.16, 0.12, 0.09, 0.07, 0.06, 0.05]
+
+# --- EMA Smoothing ---
+ema_alpha: 0.6
+
+# --- Donus Ayarlari ---
+turn_curvature_thresh: 0.03
+turn_align_thresh_deg: 10.0
+turn_forward_pwm: 150
+turn_yaw_boost: 3.0
+coast_timeout: 1.5
+coast_yaw_decay: 0.55
+reverse_yaw_pwm: 150
+
+# --- Maske Ayarlari ---
+mask_threshold: 128
+min_mask_area: 500
+mask_timeout_sec: 3.0
+
+# --- SAM3 ---
+sam3_prompt: "pipe"
+sam3_api_url: "http://localhost:5003"
+
+# --- DDS ---
+dds_domain: 0
+mask_topic: "sam3/bottom/segmentation_mask"
+command_topic: "embedded/control/stream_command"

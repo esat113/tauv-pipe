@@ -1,0 +1,13 @@
+services:
+  tauv-pipe:
+    build: .
+    container_name: tauv-pipe
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - JETSON_IP=${JETSON_IP:-192.168.1.100}
+      - PC_IP=${PC_IP:-192.168.1.101}
+      - DDS_INTERFACE=${DDS_INTERFACE:-enp3s0}
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro

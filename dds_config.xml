@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CycloneDDS>
+  <Domain id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface name="enp108s0" priority="default" multicast="default"/>
+      </Interfaces>
+      <AllowMulticast>default</AllowMulticast>
+      <MaxMessageSize>131000B</MaxMessageSize>
+      <FragmentSize>32kB</FragmentSize>
+    </General>
+
+    <Discovery>
+      <Peers>
+        <Peer Address="192.168.1.100"/>
+        <Peer Address="192.168.1.101"/>
+      </Peers>
+    </Discovery>
+  </Domain>
+</CycloneDDS>
