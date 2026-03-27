@@ -66,7 +66,7 @@ class CommandPublisher:
 
     def send(self, rc: dict):
         cmd = StreamCommand(
-            command_type="RC_OVERRIDE",
+            command_type="motor_rc",
             command_data=json.dumps(rc),
             timestamp=int(time.time() * 1000),
         )

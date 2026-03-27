@@ -42,9 +42,12 @@ from cyclonedds.domain import DomainParticipant
 from cyclonedds.sub import DataReader
 from cyclonedds.pub import DataWriter
 from cyclonedds.topic import Topic
+from cyclonedds.qos import Qos, Policy
 from cyclonedds.idl import IdlStruct
 from cyclonedds.idl.types import sequence, uint8
 from dataclasses import dataclass
+
+BEST_EFFORT_QOS = Qos(Policy.Reliability.BestEffort, Policy.History.KeepLast(depth=1))
 
 from pipe_algorithm import MaskProcessor, PipeController, ProcessResult
 
@@ -114,6 +117,7 @@ class StreamCommand(IdlStruct):
     command_type: str
     command_data: str
     timestamp: int
+    client_id: str
 
 # ═══════════════════════════════════════════════════════════
 # DDS Yardimci Siniflar
@@ -172,8 +176,8 @@ class FrameAssembler:
 
 class DDSCameraReader:
     def __init__(self, participant, topic_name):
-        self._topic = Topic(participant, topic_name, FrameChunk)
-        self._reader = DataReader(participant, self._topic)
+        self._topic = Topic(participant, topic_name, FrameChunk, qos=BEST_EFFORT_QOS)
+        self._reader = DataReader(participant, self._topic, qos=BEST_EFFORT_QOS)
         self._assembler = FrameAssembler()
         self._frame = None
         self._lock = threading.Lock()
@@ -213,8 +217,8 @@ class DDSCameraReader:
 
 class DDSMaskReader:
     def __init__(self, participant, topic_name):
-        self._topic = Topic(participant, topic_name, SegmentationMask)
-        self._reader = DataReader(participant, self._topic)
+        self._topic = Topic(participant, topic_name, SegmentationMask, qos=BEST_EFFORT_QOS)
+        self._reader = DataReader(participant, self._topic, qos=BEST_EFFORT_QOS)
         self._mask = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -246,14 +250,15 @@ class DDSMaskReader:
 
 class DDSCommandPublisher:
     def __init__(self, participant, topic_name):
-        self._topic = Topic(participant, topic_name, StreamCommand)
-        self._writer = DataWriter(participant, self._topic)
+        self._topic = Topic(participant, topic_name, StreamCommand, qos=BEST_EFFORT_QOS)
+        self._writer = DataWriter(participant, self._topic, qos=BEST_EFFORT_QOS)
 
     def send(self, rc: dict):
         self._writer.write(StreamCommand(
-            command_type="RC_OVERRIDE",
+            command_type="motor_rc",
             command_data=json.dumps(rc),
             timestamp=int(time.time() * 1000),
+            client_id="tauv-pipe-gui",
         ))
 
 
@@ -326,6 +331,7 @@ class VehicleControlTab(QWidget):
         self.control_buttons = []
         self.rc_channels = [0] * 8
         self.servo_outputs = [0] * 8
+        self._rc_send_active = True
 
         self._depth_target = None
         self._depth_tolerance = 0.3
@@ -360,6 +366,18 @@ class VehicleControlTab(QWidget):
         with self._lock:
             self.pwm_values = [1500] * 8
         self.active_keys.clear()
+
+    def _toggle_rc_send(self):
+        self._rc_send_active = not self._rc_send_active
+        if self._rc_send_active:
+            self.btn_rc_toggle.setText("RC GONDERIM: AKTIF")
+            self.btn_rc_toggle.setStyleSheet(f"background: {C_OK}; font-size: 13px; padding: 12px;")
+            self._log("RC override gonderimi AKTIF")
+        else:
+            self._stop_all()
+            self.btn_rc_toggle.setText("RC GONDERIM: KAPALI")
+            self.btn_rc_toggle.setStyleSheet(f"background: {C_DIM}; font-size: 13px; padding: 12px;")
+            self._log("RC override gonderimi KAPALI (bridge kontrol ediyor)")
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -523,11 +541,17 @@ class VehicleControlTab(QWidget):
 
         layout.addWidget(motor_group)
 
-        # E-STOP
+        # E-STOP + RC Toggle
+        estop_row = QHBoxLayout()
         self.btn_stop = QPushButton("TUM MOTORLARI DURDUR (SPACE)")
         self.btn_stop.setStyleSheet(f"background: {C_DANGER}; font-size: 16px; padding: 12px;")
         self.btn_stop.clicked.connect(self._stop_all)
-        layout.addWidget(self.btn_stop)
+        estop_row.addWidget(self.btn_stop)
+        self.btn_rc_toggle = QPushButton("RC GONDERIM: AKTIF")
+        self.btn_rc_toggle.setStyleSheet(f"background: {C_OK}; font-size: 13px; padding: 12px;")
+        self.btn_rc_toggle.clicked.connect(self._toggle_rc_send)
+        estop_row.addWidget(self.btn_rc_toggle)
+        layout.addLayout(estop_row)
 
         # Telemetri: RC Girdi + Servo Cikti + Gonderilen PWM
         telem_row = QHBoxLayout()
@@ -840,7 +864,7 @@ class VehicleControlTab(QWidget):
                         mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
                     last_hb = now
 
-                if now - last_rc >= 0.05:
+                if self._rc_send_active and now - last_rc >= 0.05:
                     with self._lock:
                         vals = self.pwm_values.copy()
                     rc_all = vals + [65535] * 10
@@ -1045,13 +1069,19 @@ class VehicleControlTab(QWidget):
 # ═══════════════════════════════════════════════════════════
 
 class PipeTrackingTab(QWidget):
-    """Sekme 2: DDS kamera + SAM3 mask ile boru takip."""
+    """Sekme 2: DDS kamera + SAM3 mask ile boru takip.
+    Algoritma ayri thread'de blocking calisir (eski main.py gibi).
+    GUI sadece izleme yapar.
+    """
 
     def __init__(self, participant, shared_state, parent=None):
         super().__init__(parent)
         self._shared = shared_state
-        self.tracking = False
-        self.last_cmd = {}
+        self._pipe_state = {
+            "tracking": False, "state": "IDLE", "cmd": {}, "result": None,
+            "info": "", "pass_count": 0, "error": None,
+        }
+        self._pipe_lock = threading.Lock()
 
         self.processor = MaskProcessor(
             num_slices=8,
@@ -1059,16 +1089,21 @@ class PipeTrackingTab(QWidget):
         )
         self.controller = PipeController()
 
-        self.front_cam = DDSCameraReader(participant, "camera/front/frame/rgb8")
-        self.bottom_cam = DDSCameraReader(participant, "camera/bottom/frame/rgb8")
-        self.front_mask_reader = DDSMaskReader(participant, "sam3/front/segmentation_mask")
+        self.front_cam = DDSCameraReader(participant, "camera/front/frame")
+        self.bottom_cam = DDSCameraReader(participant, "camera/bottom/frame")
         self.bottom_mask_reader = DDSMaskReader(participant, "sam3/bottom/segmentation_mask")
+        self.front_mask_reader = DDSMaskReader(participant, "sam3/front/segmentation_mask")
+        self._algo_mask_reader = DDSMaskReader(participant, "sam3/bottom/segmentation_mask")
         self.cmd_pub = DDSCommandPublisher(participant, "embedded/control/stream_command")
 
         self.front_cam.start()
         self.bottom_cam.start()
-        self.front_mask_reader.start()
         self.bottom_mask_reader.start()
+        self.front_mask_reader.start()
+        self._algo_mask_reader.start()
+
+        self._stop_event = threading.Event()
+        self._algo_thread = None
 
         self._build_ui()
 
@@ -1076,11 +1111,63 @@ class PipeTrackingTab(QWidget):
         self._timer.timeout.connect(self._tick)
         self._timer.start(100)
 
+    def _algo_loop(self):
+        """Blocking algoritma dongusu -- ayri thread'de calisir (eski main.py gibi)."""
+        mask_threshold = 128
+        while not self._stop_event.is_set():
+            with self._pipe_lock:
+                tracking = self._pipe_state["tracking"]
+            if not tracking:
+                time.sleep(0.05)
+                continue
+
+            mask_sample = self._algo_mask_reader.get_mask()
+
+            if mask_sample is None:
+                cmd = self.controller.compute(None, heading_deg=self._shared.get("heading_deg", 0.0))
+                self.cmd_pub.send(cmd)
+                with self._pipe_lock:
+                    self._pipe_state["cmd"] = cmd
+                    self._pipe_state["state"] = self.controller.state
+                    self._pipe_state["result"] = None
+                    self._pipe_state["info"] = "MASKE YOK"
+                continue
+
+            raw = np.frombuffer(bytes(mask_sample.mask_data), dtype=np.uint8)
+            try:
+                mask = raw.reshape(mask_sample.height, mask_sample.width)
+            except ValueError:
+                continue
+            _, binary = cv2.threshold(mask, mask_threshold, 255, cv2.THRESH_BINARY)
+
+            result = self.processor.process(binary)
+            heading = self._shared.get("heading_deg", 0.0)
+            cmd = self.controller.compute(result, heading_deg=heading)
+            self.cmd_pub.send(cmd)
+
+            st = self.controller.state
+            info_parts = [f"Gecis:{self.controller.pass_count}/2"]
+            if st == PipeController.STATE_REVERSE:
+                diff = (self.controller._reverse_target_hdg - heading + 180) % 360 - 180
+                info_parts.append(f"180DON fark={diff:+.0f}")
+            elif result.error is not None:
+                cont = "DEVAM" if result.pipe_continues else "SON"
+                info_parts.append(f"err={result.error:+.2f} scan={result.scan_hit_count}({cont})")
+            info_parts.append(f"yaw={cmd['yaw']} fwd={cmd['forward']} hdg={heading:.0f}")
+
+            with self._pipe_lock:
+                self._pipe_state["cmd"] = cmd
+                self._pipe_state["state"] = st
+                self._pipe_state["result"] = result
+                self._pipe_state["info"] = "  ".join(info_parts)
+                self._pipe_state["pass_count"] = self.controller.pass_count
+                if st == PipeController.STATE_COMPLETE:
+                    self._pipe_state["tracking"] = False
+
     def _build_ui(self):
         lay = QVBoxLayout(self)
         lay.setSpacing(4)
 
-        # Gorev
         top = QHBoxLayout()
         tg = QGroupBox("Boru Takip Gorevi")
         tl = QHBoxLayout(tg)
@@ -1102,7 +1189,6 @@ class PipeTrackingTab(QWidget):
         top.addWidget(tg)
         lay.addLayout(top)
 
-        # Kameralar
         cam_row = QHBoxLayout()
         for name, attr in [("On Kamera + SAM3", "front_view"), ("Alt Kamera + Algoritma", "bottom_view")]:
             g = QGroupBox(name)
@@ -1116,7 +1202,6 @@ class PipeTrackingTab(QWidget):
             cam_row.addWidget(g)
         lay.addLayout(cam_row)
 
-        # SAM3 Prompt
         sam3_group = QGroupBox("SAM3 Prompt")
         sam3_lay = QHBoxLayout(sam3_group)
         sam3_lay.addWidget(QLabel("Front:"))
@@ -1141,7 +1226,6 @@ class PipeTrackingTab(QWidget):
         sam3_lay.addStretch()
         lay.addWidget(sam3_group)
 
-        # Tuning
         tune_group = QGroupBox("Algoritma Tuning")
         tg_lay = QGridLayout(tune_group)
         self.tune_inputs = {}
@@ -1164,10 +1248,8 @@ class PipeTrackingTab(QWidget):
         tg_lay.addWidget(btn_tune, 2, 8, 1, 2)
         lay.addWidget(tune_group)
 
-        # RC + Servo telemetri (MAVLink'ten, shared_state uzerinden)
         telem_row = QHBoxLayout()
         ch_names = ['Pitch', 'Roll', 'Thr', 'Yaw', 'Fwd', 'Lat', 'Pan', 'Tilt']
-
         rc_group = QGroupBox("RC Girdi")
         rc_lay = QHBoxLayout(rc_group)
         self.pipe_rc_labels = []
@@ -1179,7 +1261,6 @@ class PipeTrackingTab(QWidget):
             rc_lay.addWidget(lbl)
             self.pipe_rc_labels.append(lbl)
         telem_row.addWidget(rc_group)
-
         servo_group = QGroupBox("Motor Cikti")
         servo_lay = QHBoxLayout(servo_group)
         self.pipe_servo_labels = []
@@ -1191,10 +1272,8 @@ class PipeTrackingTab(QWidget):
             servo_lay.addWidget(lbl)
             self.pipe_servo_labels.append(lbl)
         telem_row.addWidget(servo_group)
-
         lay.addLayout(telem_row)
 
-        # Log
         lg = QGroupBox("Pipe Log")
         ll = QVBoxLayout(lg)
         self.log_text = QTextEdit()
@@ -1246,6 +1325,7 @@ class PipeTrackingTab(QWidget):
         return cv2.addWeighted(annotated, 0.65, overlay, 0.35, 0), binary
 
     def _tick(self):
+        """GUI timer -- sadece goruntuleme, algoritma ayri thread'de."""
         ch_names = ['Pitch', 'Roll', 'Thr', 'Yaw', 'Fwd', 'Lat', 'Pan', 'Tilt']
         rc = self._shared.get("rc_channels", [0] * 8)
         servo = self._shared.get("servo_outputs", [0] * 8)
@@ -1269,44 +1349,28 @@ class PipeTrackingTab(QWidget):
 
         bottom = self.bottom_cam.get_frame()
         bottom_mask = self.bottom_mask_reader.get_mask()
-        bottom_result = None
         if bottom is not None and bottom_mask is not None:
             ann, binary = self._overlay_mask(bottom, bottom_mask)
-            bottom_result = self.processor.process(binary)
-            self._draw_slices(ann, bottom_result)
+            viz_result = self.processor.process(binary)
+            if viz_result is not None:
+                self._draw_slices(ann, viz_result)
             self._show(self.bottom_view, ann)
         elif bottom is not None:
             self._show(self.bottom_view, bottom)
 
-        if not self.tracking:
-            return
+        with self._pipe_lock:
+            st = self._pipe_state["state"]
+            info = self._pipe_state["info"]
+            tracking = self._pipe_state["tracking"]
 
-        heading = self._shared.get("heading_deg", 0.0)
-        cmd = self.controller.compute(bottom_result, heading_deg=heading)
-        self.last_cmd = cmd
-        st = self.controller.state
         self.state_label.setText(st)
+        self.info_label.setText(info)
 
-        if st == PipeController.STATE_COMPLETE:
-            self.state_label.setText("GOREV TAMAMLANDI")
+        if st == PipeController.STATE_COMPLETE and self.btn_stop.isEnabled():
             self.state_label.setStyleSheet(f"color: {C_OK}; font-size: 20px; font-weight: bold;")
-            self.tracking = False
             self.btn_start.setEnabled(True)
             self.btn_stop.setEnabled(False)
             self._log("GOREV TAMAMLANDI")
-            self.cmd_pub.send(cmd)
-            return
-
-        info = [f"Gecis:{self.controller.pass_count}/2"]
-        if st == PipeController.STATE_REVERSE:
-            diff = (self.controller._reverse_target_hdg - heading + 180) % 360 - 180
-            info.append(f"180DON fark={diff:+.0f}")
-        elif bottom_result and bottom_result.error is not None:
-            cont = "DEVAM" if bottom_result.pipe_continues else "SON"
-            info.append(f"err={bottom_result.error:+.2f} scan={bottom_result.scan_hit_count}({cont})")
-        info.append(f"yaw={cmd['yaw']} fwd={cmd['forward']} hdg={heading:.0f}")
-        self.info_label.setText("  ".join(info))
-        self.cmd_pub.send(cmd)
 
     def _draw_slices(self, frame, result):
         if result is None or result.error is None or len(result.slice_centroids) < 2:
@@ -1349,15 +1413,22 @@ class PipeTrackingTab(QWidget):
 
     def _on_start(self):
         self.controller.reset()
-        self.tracking = True
+        with self._pipe_lock:
+            self._pipe_state["tracking"] = True
+            self._pipe_state["state"] = "FOLLOW"
+            self._pipe_state["info"] = ""
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.state_label.setText("FOLLOW")
         self.state_label.setStyleSheet(f"color: {C_ACCENT}; font-size: 20px; font-weight: bold;")
-        self._log("Takip baslatildi")
+        if self._algo_thread is None or not self._algo_thread.is_alive():
+            self._stop_event.clear()
+            self._algo_thread = threading.Thread(target=self._algo_loop, daemon=True, name="pipe-algo")
+            self._algo_thread.start()
+        self._log("Takip baslatildi (ayri thread)")
 
     def _on_stop(self):
-        self.tracking = False
+        with self._pipe_lock:
+            self._pipe_state["tracking"] = False
         self.cmd_pub.send(self.controller.stop_cmd())
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
@@ -1371,11 +1442,16 @@ class PipeTrackingTab(QWidget):
         self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
 
     def cleanup(self):
-        self.tracking = False
+        with self._pipe_lock:
+            self._pipe_state["tracking"] = False
+        self._stop_event.set()
+        if self._algo_thread and self._algo_thread.is_alive():
+            self._algo_thread.join(timeout=3.0)
         self.front_cam.stop()
         self.bottom_cam.stop()
         self.front_mask_reader.stop()
         self.bottom_mask_reader.stop()
+        self._algo_mask_reader.stop()
 
 
 # ═══════════════════════════════════════════════════════════

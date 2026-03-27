@@ -27,6 +27,9 @@ from cyclonedds.domain import DomainParticipant
 from cyclonedds.sub import DataReader
 from cyclonedds.pub import DataWriter
 from cyclonedds.topic import Topic
+from cyclonedds.qos import Qos, Policy
+
+BEST_EFFORT_QOS = Qos(Policy.Reliability.BestEffort, Policy.History.KeepLast(depth=1))
 from cyclonedds.idl import IdlStruct
 from cyclonedds.idl.types import sequence, uint8
 from dataclasses import dataclass
@@ -60,6 +63,7 @@ class StreamCommand(IdlStruct):
     command_type: str
     command_data: str
     timestamp: int
+    client_id: str
 
 
 # --- DDS Frame Assembler ---
@@ -124,8 +128,8 @@ class FrameAssembler:
 
 class DDSCameraReader:
     def __init__(self, participant, topic_name):
-        self._topic = Topic(participant, topic_name, FrameChunk)
-        self._reader = DataReader(participant, self._topic)
+        self._topic = Topic(participant, topic_name, FrameChunk, qos=BEST_EFFORT_QOS)
+        self._reader = DataReader(participant, self._topic, qos=BEST_EFFORT_QOS)
         self._assembler = FrameAssembler()
         self._frame = None
         self._lock = threading.Lock()
@@ -149,11 +153,9 @@ class DDSCameraReader:
                     payload, encoding = result
                     data = np.frombuffer(payload, dtype=np.uint8)
                     img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-                    if img is not None:
-                        if encoding != "rgb8":
-                            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                        with self._lock:
-                            self._frame = img
+                    
+                    with self._lock:
+                        self._frame = img
             except Exception:
                 pass
             time.sleep(0.005)
@@ -167,8 +169,8 @@ class DDSCameraReader:
 
 class DDSMaskReader:
     def __init__(self, participant, topic_name):
-        self._topic = Topic(participant, topic_name, SegmentationMask)
-        self._reader = DataReader(participant, self._topic)
+        self._topic = Topic(participant, topic_name, SegmentationMask, qos=BEST_EFFORT_QOS)
+        self._reader = DataReader(participant, self._topic, qos=BEST_EFFORT_QOS)
         self._mask = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -202,12 +204,12 @@ class DDSMaskReader:
 
 class DDSCommandPublisher:
     def __init__(self, participant, topic_name):
-        self._topic = Topic(participant, topic_name, StreamCommand)
-        self._writer = DataWriter(participant, self._topic)
+        self._topic = Topic(participant, topic_name, StreamCommand, qos=BEST_EFFORT_QOS)
+        self._writer = DataWriter(participant, self._topic, qos=BEST_EFFORT_QOS)
 
     def send(self, rc: dict):
         self._writer.write(StreamCommand(
-            command_type="RC_OVERRIDE",
+            command_type="motor_rc",
             command_data=json.dumps(rc),
             timestamp=int(time.time() * 1000),
         ))
@@ -229,8 +231,8 @@ class PipeTrackerWindow(QMainWindow):
         )
         self.controller = PipeController()
 
-        self.front_cam = DDSCameraReader(participant, "camera/front/frame/rgb8")
-        self.bottom_cam = DDSCameraReader(participant, "camera/bottom/frame/rgb8")
+        self.front_cam = DDSCameraReader(participant, "camera/front/frame")
+        self.bottom_cam = DDSCameraReader(participant, "camera/bottom/frame")
         self.front_mask_reader = DDSMaskReader(participant, "sam3/front/segmentation_mask")
         self.bottom_mask_reader = DDSMaskReader(participant, "sam3/bottom/segmentation_mask")
         self.cmd_pub = DDSCommandPublisher(participant, "embedded/control/stream_command")
