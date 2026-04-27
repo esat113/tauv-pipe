@@ -153,7 +153,9 @@ class DDSCameraReader:
                     payload, encoding = result
                     data = np.frombuffer(payload, dtype=np.uint8)
                     img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-                    
+                    if img is not None and encoding != "rgb8":
+                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
                     with self._lock:
                         self._frame = img
             except Exception:
@@ -606,7 +608,7 @@ def main():
     print("=" * 60)
     print("PIPE TRACKER GUI - DDS (tauv-pipe)")
     print("=" * 60)
-    print("Kameralar: DDS FrameChunk (camera/front|bottom/frame/rgb8)")
+    print("Kameralar: DDS FrameChunk (camera/front|bottom/frame, MJPEG)")
     print("Maske: DDS SegmentationMask (sam3/bottom/segmentation_mask)")
     print("Komut: DDS StreamCommand (embedded/control/stream_command)")
     print("Algoritma: pipe_algorithm.py")
