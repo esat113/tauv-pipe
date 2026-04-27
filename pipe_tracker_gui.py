@@ -10,6 +10,7 @@ import os
 import time
 import json
 import threading
+from collections import deque
 
 os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
 
@@ -79,6 +80,7 @@ class FrameAssembler:
         self.width = 0
         self.height = 0
         self.encoding = ""
+        self.timestamp = 0.0
         self.buffers = []
 
     def push(self, chunk):
@@ -93,6 +95,7 @@ class FrameAssembler:
                 self.width = int(chunk.width)
                 self.height = int(chunk.height)
                 self.encoding = str(chunk.encoding)
+                self.timestamp = float(chunk.timestamp)
                 self.buffers = [None] * total
 
             if self.expected_chunks is None:
@@ -120,18 +123,25 @@ class FrameAssembler:
 
             payload = b"".join(self.buffers)
             enc = self.encoding
+            ts = self.timestamp
             self.reset()
-            return payload, enc
+            return payload, enc, ts
 
 
 # --- DDS Camera Reader ---
 
 class DDSCameraReader:
+    """Camera frame reader. Son N frame'i (ts_ms, rgb) olarak rolling buffer'da
+    tutar; SAM3 maskesi geldiginde GUI ayni timestamp'li frame'i buradan ister
+    ve overlay senkron olur (live frame + late mask lag'i ortadan kalkar)."""
+
+    BUFFER_SIZE = 120
+
     def __init__(self, participant, topic_name):
         self._topic = Topic(participant, topic_name, FrameChunk, qos=BEST_EFFORT_QOS)
         self._reader = DataReader(participant, self._topic, qos=BEST_EFFORT_QOS)
         self._assembler = FrameAssembler()
-        self._frame = None
+        self._buffer: deque = deque(maxlen=self.BUFFER_SIZE)
         self._lock = threading.Lock()
         self._stop = threading.Event()
 
@@ -150,21 +160,36 @@ class DDSCameraReader:
                     result = self._assembler.push(chunk)
                     if result is None:
                         continue
-                    payload, encoding = result
+                    payload, encoding, ts_ms = result
                     data = np.frombuffer(payload, dtype=np.uint8)
                     img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-                    if img is not None and encoding != "rgb8":
+                    if img is None:
+                        continue
+                    if encoding != "rgb8":
                         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
                     with self._lock:
-                        self._frame = img
+                        self._buffer.append((float(ts_ms), img))
             except Exception:
                 pass
             time.sleep(0.005)
 
     def get_frame(self):
+        """En son frame (geriye uyumluluk icin)."""
         with self._lock:
-            return self._frame.copy() if self._frame is not None else None
+            if not self._buffer:
+                return None
+            return self._buffer[-1][1].copy()
+
+    def get_frame_at(self, ts_ms: float, max_age_ms: float = 2000.0):
+        """Verilen timestamp'e en yakin frame'i dondur. Eslesme yas farki
+        max_age_ms'in disindaysa None."""
+        with self._lock:
+            if not self._buffer:
+                return None
+            best = min(self._buffer, key=lambda item: abs(item[0] - ts_ms))
+        if abs(best[0] - ts_ms) > max_age_ms:
+            return None
+        return best[1].copy()
 
 
 # --- DDS Mask Reader ---
@@ -174,6 +199,7 @@ class DDSMaskReader:
         self._topic = Topic(participant, topic_name, SegmentationMask, qos=BEST_EFFORT_QOS)
         self._reader = DataReader(participant, self._topic, qos=BEST_EFFORT_QOS)
         self._mask = None
+        self._mask_ts = 0.0
         self._lock = threading.Lock()
         self._stop = threading.Event()
 
@@ -193,6 +219,7 @@ class DDSMaskReader:
                     mask = raw.reshape(sample.height, sample.width)
                     with self._lock:
                         self._mask = mask
+                        self._mask_ts = float(sample.timestamp)
             except Exception:
                 pass
             time.sleep(0.005)
@@ -200,6 +227,14 @@ class DDSMaskReader:
     def get_mask(self):
         with self._lock:
             return self._mask.copy() if self._mask is not None else None
+
+    def get_mask_with_meta(self):
+        """En son mask'i (mask, ts_ms) olarak dondur. SAM3 mask'in olustugu
+        kaynak frame'in timestamp'ini tasiyor (ms cinsinden)."""
+        with self._lock:
+            if self._mask is None:
+                return None
+            return self._mask.copy(), self._mask_ts
 
 
 # --- DDS Command Publisher ---
@@ -233,15 +268,11 @@ class PipeTrackerWindow(QMainWindow):
         )
         self.controller = PipeController()
 
-        self.front_cam = DDSCameraReader(participant, "camera/front/frame")
         self.bottom_cam = DDSCameraReader(participant, "camera/bottom/frame")
-        self.front_mask_reader = DDSMaskReader(participant, "sam3/front/segmentation_mask")
         self.bottom_mask_reader = DDSMaskReader(participant, "sam3/bottom/segmentation_mask")
         self.cmd_pub = DDSCommandPublisher(participant, "embedded/control/stream_command")
 
-        self.front_cam.start()
         self.bottom_cam.start()
-        self.front_mask_reader.start()
         self.bottom_mask_reader.start()
 
         self._init_ui()
@@ -294,28 +325,22 @@ class PipeTrackerWindow(QMainWindow):
         top.addWidget(tg)
         lay.addLayout(top)
 
-        # Cameras
+        # Cameras: tek panel -- alt kamera + senkron SAM3 mask overlay.
+        # SAM3 sadece bottom kamerada calistigi icin front paneli yok.
         cam_row = QHBoxLayout()
-        for name, attr in [("On Kamera (Front)", "front_view"), ("Alt Kamera + Mask (Bottom)", "bottom_view")]:
-            g = QGroupBox(name)
-            v = QVBoxLayout(g)
-            lbl = QLabel("DDS bekleniyor...")
-            lbl.setFixedSize(560, 380)
-            lbl.setStyleSheet("background: #111; border: 1px solid #333;")
-            lbl.setAlignment(Qt.AlignCenter)
-            setattr(self, attr, lbl)
-            v.addWidget(lbl)
-            cam_row.addWidget(g)
+        bottom_group = QGroupBox("Alt Kamera + Mask (senkron) + Algoritma")
+        bv = QVBoxLayout(bottom_group)
+        self.bottom_view = QLabel("DDS bekleniyor...")
+        self.bottom_view.setMinimumSize(960, 600)
+        self.bottom_view.setStyleSheet("background: #111; border: 1px solid #333;")
+        self.bottom_view.setAlignment(Qt.AlignCenter)
+        bv.addWidget(self.bottom_view)
+        cam_row.addWidget(bottom_group)
         lay.addLayout(cam_row)
 
-        # SAM3 Prompt
-        sam3_group = QGroupBox("SAM3 Prompt")
+        # SAM3 Prompt (sadece bottom)
+        sam3_group = QGroupBox("SAM3 Prompt (bottom)")
         sam3_lay = QHBoxLayout(sam3_group)
-        sam3_lay.addWidget(QLabel("Front:"))
-        self.front_prompt_input = QLineEdit("pipe")
-        self.front_prompt_input.setMaximumWidth(120)
-        self.front_prompt_input.setStyleSheet("background: #16213e; color: white; border: 1px solid #533483; padding: 3px;")
-        sam3_lay.addWidget(self.front_prompt_input)
         sam3_lay.addWidget(QLabel("Bottom:"))
         self.bottom_prompt_input = QLineEdit("pipe")
         self.bottom_prompt_input.setMaximumWidth(120)
@@ -382,24 +407,20 @@ class PipeTrackerWindow(QMainWindow):
     def _send_prompts(self):
         import requests
         url = self.sam3_url_input.text().strip().rstrip("/")
-        results = []
-        for camera, inp in [("front", self.front_prompt_input), ("bottom", self.bottom_prompt_input)]:
-            prompt = inp.text().strip()
-            if not prompt:
-                continue
-            try:
-                resp = requests.post(
-                    f"{url}/api/prompt",
-                    json={"camera": camera, "prompt": prompt},
-                    timeout=5,
-                )
-                if resp.ok:
-                    results.append(f"{camera}=OK")
-                else:
-                    results.append(f"{camera}=HATA({resp.status_code})")
-            except Exception as e:
-                results.append(f"{camera}=BAGLANTI HATASI")
-        status = "  ".join(results) if results else "Prompt bos"
+        prompt = self.bottom_prompt_input.text().strip()
+        if not prompt:
+            self.sam3_status_label.setText("Prompt bos")
+            self._log("SAM3 prompt: bos")
+            return
+        try:
+            resp = requests.post(
+                f"{url}/api/prompt",
+                json={"camera": "bottom", "prompt": prompt},
+                timeout=5,
+            )
+            status = "bottom=OK" if resp.ok else f"bottom=HATA({resp.status_code})"
+        except Exception:
+            status = "bottom=BAGLANTI HATASI"
         self.sam3_status_label.setText(status)
         self._log(f"SAM3 prompt: {status}")
 
@@ -438,26 +459,28 @@ class PipeTrackerWindow(QMainWindow):
         return annotated, binary
 
     def _tick(self):
-        front = self.front_cam.get_frame()
-        front_mask = self.front_mask_reader.get_mask()
-
-        if front is not None and front_mask is not None:
-            annotated_front, _ = self._overlay_mask(front, front_mask)
-            self._show(self.front_view, annotated_front)
-        elif front is not None:
-            self._show(self.front_view, front)
-
-        bottom = self.bottom_cam.get_frame()
-        bottom_mask = self.bottom_mask_reader.get_mask()
+        # Mask-driven senkron overlay: SAM3 mask'i timestamp tasiyor (kaynak
+        # frame'in zamani). O frame'i camera buffer'indan al, ikisini overlay
+        # et -- bu sayede live frame + late mask lag'i ortadan kalkar.
         bottom_result = None
+        sample = self.bottom_mask_reader.get_mask_with_meta()
 
-        if bottom is not None and bottom_mask is not None:
-            annotated_bottom, binary = self._overlay_mask(bottom, bottom_mask)
-            bottom_result = self.processor.process(binary)
-            self._draw_slices(annotated_bottom, bottom_result)
-            self._show(self.bottom_view, annotated_bottom)
-        elif bottom is not None:
-            self._show(self.bottom_view, bottom)
+        if sample is not None:
+            bottom_mask, mask_ts = sample
+            bottom = self.bottom_cam.get_frame_at(mask_ts, max_age_ms=2000.0)
+            if bottom is None:
+                # Buffer'da yeterince eski frame yok (ornegin GUI yeni acildi)
+                # -- en son frame'le fallback yap.
+                bottom = self.bottom_cam.get_frame()
+            if bottom is not None:
+                annotated_bottom, binary = self._overlay_mask(bottom, bottom_mask)
+                bottom_result = self.processor.process(binary)
+                self._draw_slices(annotated_bottom, bottom_result)
+                self._show(self.bottom_view, annotated_bottom)
+        else:
+            bottom = self.bottom_cam.get_frame()
+            if bottom is not None:
+                self._show(self.bottom_view, bottom)
 
         if not self.tracking:
             return
@@ -592,9 +615,7 @@ class PipeTrackerWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.tracking = False
-        self.front_cam.stop()
         self.bottom_cam.stop()
-        self.front_mask_reader.stop()
         self.bottom_mask_reader.stop()
         event.accept()
 
@@ -608,10 +629,10 @@ def main():
     print("=" * 60)
     print("PIPE TRACKER GUI - DDS (tauv-pipe)")
     print("=" * 60)
-    print("Kameralar: DDS FrameChunk (camera/front|bottom/frame, MJPEG)")
-    print("Maske: DDS SegmentationMask (sam3/bottom/segmentation_mask)")
-    print("Komut: DDS StreamCommand (embedded/control/stream_command)")
-    print("Algoritma: pipe_algorithm.py")
+    print("Kamera: DDS FrameChunk (camera/bottom/frame, MJPEG)")
+    print("Maske : DDS SegmentationMask (sam3/bottom/segmentation_mask)")
+    print("Komut : DDS StreamCommand (embedded/control/stream_command)")
+    print("Algo  : pipe_algorithm.py  -- mask senkron overlay (mask ts ile frame eslesmesi)")
     print("=" * 60)
 
     participant = DomainParticipant(domain_id=args.domain_id)
