@@ -9,13 +9,25 @@ import sys
 import os
 import time
 import json
+import math
 import threading
 from collections import deque
 
 os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
 
+# tauv-client'i Python path'e al -- monorepo icinde kardes submodule.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tauv-client", "src"))
+
 import cv2
 import numpy as np
+
+try:
+    from tauv_client import Vehicle
+except Exception as _exc:
+    Vehicle = None
+    _vehicle_import_error = _exc
+else:
+    _vehicle_import_error = None
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -259,8 +271,13 @@ class PipeTrackerWindow(QMainWindow):
         super().__init__()
         self._participant = participant
         self.tracking = False
-        self.heading_deg = 0.0
         self.last_cmd = {}
+
+        self._heading_lock = threading.Lock()
+        self._heading_deg = 0.0
+        self._heading_ok = False
+        self._vehicle = None
+        self._heading_stop = threading.Event()
 
         self.processor = MaskProcessor(
             num_slices=8,
@@ -277,9 +294,42 @@ class PipeTrackerWindow(QMainWindow):
 
         self._init_ui()
 
+        # tauv-client Vehicle ile attitude.yaw -> heading_deg beslemesi.
+        # 180 donus reverse'i ve compute() icin gerekli.
+        if Vehicle is None:
+            self._log(f"UYARI: tauv-client import edilemedi ({_vehicle_import_error!r}); heading=0 sabit kalacak, REVERSE state takilir.")
+        else:
+            try:
+                self._vehicle = Vehicle()
+                threading.Thread(target=self._heading_loop, daemon=True, name="pipe-heading").start()
+                self._log("Heading thread'i basladi (tauv-client Vehicle.attitude)")
+            except Exception as exc:
+                self._vehicle = None
+                self._log(f"UYARI: Vehicle baslatilamadi: {exc}")
+
         self.timer = QTimer()
         self.timer.timeout.connect(self._tick)
         self.timer.start(100)
+
+    def _heading_loop(self):
+        """Vehicle.attitude'u poll ederek heading_deg'i guncelle.
+        attitude.yaw radian; 0..360 dereceye normalize edilir."""
+        while not self._heading_stop.is_set():
+            try:
+                att = self._vehicle.attitude
+                hdg = math.degrees(att.yaw) % 360.0
+                with self._heading_lock:
+                    self._heading_deg = hdg
+                    self._heading_ok = True
+            except Exception:
+                with self._heading_lock:
+                    self._heading_ok = False
+            time.sleep(0.05)
+
+    @property
+    def heading_deg(self) -> float:
+        with self._heading_lock:
+            return self._heading_deg
 
     def _init_ui(self):
         self.setWindowTitle("Pipe Tracker - DDS (tauv-pipe)")
@@ -319,6 +369,9 @@ class PipeTrackerWindow(QMainWindow):
         self.state_label = QLabel("IDLE")
         self.state_label.setStyleSheet("color: #e94560; font-size: 20px; font-weight: bold;")
         tl.addWidget(self.state_label)
+        self.heading_label = QLabel("hdg=---")
+        self.heading_label.setStyleSheet("color: #7c8aff; font-size: 13px; font-weight: bold;")
+        tl.addWidget(self.heading_label)
         self.info_label = QLabel("")
         self.info_label.setStyleSheet("color: #aaa; font-size: 11px;")
         tl.addWidget(self.info_label)
@@ -459,6 +512,18 @@ class PipeTrackerWindow(QMainWindow):
         return annotated, binary
 
     def _tick(self):
+        # Heading label'i her tick guncelle -- REVERSE state'i icin
+        # gercek heading geliyor mu acikca gor.
+        with self._heading_lock:
+            hdg_now = self._heading_deg
+            hdg_ok = self._heading_ok
+        if hdg_ok:
+            self.heading_label.setText(f"hdg={hdg_now:5.1f}")
+            self.heading_label.setStyleSheet("color: #7c8aff; font-size: 13px; font-weight: bold;")
+        else:
+            self.heading_label.setText("hdg=YOK")
+            self.heading_label.setStyleSheet("color: #c62828; font-size: 13px; font-weight: bold;")
+
         # Mask-driven senkron overlay: SAM3 mask'i timestamp tasiyor (kaynak
         # frame'in zamani). O frame'i camera buffer'indan al, ikisini overlay
         # et -- bu sayede live frame + late mask lag'i ortadan kalkar.
@@ -490,24 +555,15 @@ class PipeTrackerWindow(QMainWindow):
         st = self.controller.state
         self.state_label.setText(st)
 
-        if st == PipeController.STATE_COMPLETE:
-            self.state_label.setText("GOREV TAMAMLANDI")
-            self.state_label.setStyleSheet("color: #4CAF50; font-size: 20px; font-weight: bold;")
-            self.tracking = False
-            self.btn_start.setEnabled(True)
-            self.btn_stop.setEnabled(False)
-            self._log("GOREV TAMAMLANDI - 2 gecis bitti")
-            self.cmd_pub.send(cmd)
-            return
-
-        info_parts = [f"Gecis: {self.controller.pass_count}/2"]
+        info_parts = []
         if st == PipeController.STATE_REVERSE:
             target = self.controller._reverse_target_hdg
-            diff = (target - self.heading_deg + 180) % 360 - 180
-            info_parts.append(f"| 180 DONUS: hedef={target:.0f} fark={diff:+.0f}")
+            diff = (target - hdg_now + 180) % 360 - 180
+            info_parts.append(f"180 DONUS: hedef={target:.0f} fark={diff:+.0f}")
         elif st == PipeController.STATE_REACQUIRE:
             elapsed = time.time() - self.controller._reacquire_start
-            info_parts.append(f"| BORU ARANIYOR ({elapsed:.1f}s/5.0s)")
+            dur = self.controller.reacquire_duration_s
+            info_parts.append(f"BORU ARANIYOR ({elapsed:.1f}s/{dur:.1f}s) fwd={self.controller.reacquire_forward_pwm}")
         elif bottom_result and bottom_result.error is not None:
             info_parts.append(f"err={bottom_result.error:+.2f}")
             info_parts.append(f"ang={bottom_result.pipe_angle_deg:+.0f}")
@@ -515,8 +571,8 @@ class PipeTrackerWindow(QMainWindow):
             info_parts.append(f"scan={bottom_result.scan_hit_count}({cont})")
         else:
             info_parts.append("boru yok")
-        info_parts.append(f"| CMD yaw={cmd['yaw']} fwd={cmd['forward']}")
-        self.info_label.setText("  ".join(info_parts))
+        info_parts.append(f"CMD yaw={cmd['yaw']} fwd={cmd['forward']}")
+        self.info_label.setText("  |  ".join(info_parts))
 
         self.cmd_pub.send(cmd)
 
@@ -615,6 +671,7 @@ class PipeTrackerWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.tracking = False
+        self._heading_stop.set()
         self.bottom_cam.stop()
         self.bottom_mask_reader.stop()
         event.accept()

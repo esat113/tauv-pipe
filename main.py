@@ -74,6 +74,8 @@ def main():
         coast_timeout=cfg.get("coast_timeout", 1.5),
         coast_yaw_decay=cfg.get("coast_yaw_decay", 0.55),
         reverse_yaw_pwm=cfg.get("reverse_yaw_pwm", 150),
+        reacquire_forward_pwm=cfg.get("reacquire_forward_pwm", 100),
+        reacquire_duration_s=cfg.get("reacquire_duration_s", 5.0),
     )
 
     shutdown = False

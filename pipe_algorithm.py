@@ -222,6 +222,8 @@ class PipeController:
         coast_timeout=1.5,
         coast_yaw_decay=0.55,
         reverse_yaw_pwm=150,
+        reacquire_forward_pwm=100,
+        reacquire_duration_s=5.0,
     ):
         self.neutral = neutral_pwm
         self.forward_pwm = forward_pwm
@@ -236,6 +238,11 @@ class PipeController:
         self.coast_timeout = coast_timeout
         self.coast_yaw_decay = coast_yaw_decay
         self.reverse_yaw_pwm = reverse_yaw_pwm
+        # 180 donus sonrasi sabit ileri sureci. Mask gelmese de
+        # reacquire_duration_s boyunca reacquire_forward_pwm offset ile
+        # ileri gider, sonra FOLLOW'a doner ki coast tekrar tetiklensin.
+        self.reacquire_forward_pwm = reacquire_forward_pwm
+        self.reacquire_duration_s = reacquire_duration_s
 
         self._state = self.STATE_FOLLOW
         self._prev_err = None
@@ -243,6 +250,9 @@ class PipeController:
         self._last_yaw = 0.0
         self._last_fwd = 0
         self._last_valid_t = 0.0
+        # pass_count ve COMPLETE state artik kullanilmiyor; geriye uyumluluk
+        # icin alanlar duruyor ama hicbir yerde set edilmiyor. Gorev sonsuz
+        # dongu olarak akiyor, manuel DURDUR ile sonlandirilir.
         self._pass_count = 0
         self._continues_history = []
         self._reverse_target_hdg = 0.0
@@ -378,13 +388,11 @@ class PipeController:
             pipe_ended = false_count >= 3
 
             if pipe_ended:
-                if self._pass_count < 2:
-                    self._reverse_target_hdg = (heading_deg + 180.0) % 360.0
-                    self._state = self.STATE_REVERSE
-                    self._pass_count += 1
-                    self._continues_history = []
-                else:
-                    self._state = self.STATE_COMPLETE
+                # Her bitiste 180 donus + reacquire dongusu. Pass count yok,
+                # COMPLETE'e gecilmiyor; manuel DURDUR ile sonlandirilir.
+                self._reverse_target_hdg = (heading_deg + 180.0) % 360.0
+                self._state = self.STATE_REVERSE
+                self._continues_history = []
                 return self._make_cmd(0, 0)
             else:
                 self._state = self.STATE_FOLLOW
@@ -406,7 +414,7 @@ class PipeController:
             self._prev_err = None
             self._integral = 0.0
             self._continues_history = []
-            return self._make_cmd(0, self.forward_pwm)
+            return self._make_cmd(0, self.reacquire_forward_pwm)
 
         ratio = min(1.0, abs(diff) / 90.0)
         yaw_speed = max(40, int(self.reverse_yaw_pwm * ratio))
@@ -414,20 +422,21 @@ class PipeController:
         return self._make_cmd(yaw_dir, 0)
 
     def _reacquire_cmd(self, result):
-        """180 donus sonrasi: boruyu bulana kadar ileri git (max 5s)."""
+        """180 donus sonrasi: reacquire_duration_s boyunca sabit ileri @
+        reacquire_forward_pwm. Sure dolunca veya mask gelirse FOLLOW'a doner.
+        Sure doldugu halde mask gelmediyse coast yeniden tetiklenip dongu
+        bastan basliyor olur."""
         elapsed = time.monotonic() - self._reacquire_start
+
         if result is not None and result.error is not None:
             self._state = self.STATE_FOLLOW
             self._last_valid_t = time.monotonic()
             self._continues_history = []
             return self._follow_cmd(result)
 
-        if elapsed > 5.0:
-            if self._pass_count >= 2:
-                self._state = self.STATE_COMPLETE
-            else:
-                self._state = self.STATE_FOLLOW
-                self._last_valid_t = time.monotonic()
+        if elapsed > self.reacquire_duration_s:
+            self._state = self.STATE_FOLLOW
+            self._last_valid_t = time.monotonic()
             return self._make_cmd(0, 0)
 
-        return self._make_cmd(0, self.forward_pwm)
+        return self._make_cmd(0, self.reacquire_forward_pwm)

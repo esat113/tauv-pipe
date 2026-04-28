@@ -25,6 +25,12 @@ coast_timeout: 1.5
 coast_yaw_decay: 0.55
 reverse_yaw_pwm: 150
 
+# --- Reacquire (180 donus sonrasi sabit ileri) ---
+# Pipe bittikten sonra 180 donus + reacquire_duration_s boyunca
+# reacquire_forward_pwm offset ile ileri git, sonra FOLLOW'a don.
+reacquire_forward_pwm: 100
+reacquire_duration_s: 5.0
+
 # --- Maske Ayarlari ---
 mask_threshold: 128
 min_mask_area: 500
