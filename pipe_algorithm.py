@@ -223,7 +223,7 @@ class PipeController:
         coast_yaw_decay=0.55,
         reverse_yaw_pwm=150,
         reacquire_forward_pwm=100,
-        reacquire_duration_s=5.0,
+        reacquire_duration_s=3.0,
     ):
         self.neutral = neutral_pwm
         self.forward_pwm = forward_pwm

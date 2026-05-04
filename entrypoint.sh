@@ -17,8 +17,8 @@ else
     </General>
     <Discovery>
       <Peers>
-        <Peer Address="${JETSON_IP}"/>
-        <Peer Address="${PC_IP}"/>
+        <Peer Address="192.168.1.100"/>
+        <Peer Address="192.168.1.101"/>
       </Peers>
     </Discovery>
   </Domain>
