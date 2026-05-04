@@ -82,6 +82,9 @@ BEST_EFFORT_QOS = Qos(Policy.Reliability.BestEffort, Policy.History.KeepLast(dep
 
 @dataclass
 class FrameChunk(IdlStruct):
+    # Aligned with tauv-client / tauv-core camera FrameChunk (CDR layout must match).
+    source_id: str
+    feed: str
     timestamp: float
     chunk_buffer: sequence[uint8]
     chunk_id_in_frame: int
@@ -122,7 +125,13 @@ class FrameAssembler:
                 self.encoding = str(chunk.encoding)
                 self.buffers = [None] * total
             if self.expected_chunks is None: return None
-            if int(chunk.total_chunks_in_frame) != self.expected_chunks: self.reset(); return None
+            if (
+                int(chunk.total_chunks_in_frame) != self.expected_chunks
+                or int(chunk.width) != self.width
+                or int(chunk.height) != self.height
+                or str(chunk.encoding) != self.encoding
+            ):
+                self.reset(); return None
             idx = int(chunk.chunk_id_in_frame)
             if idx < 0 or idx >= self.expected_chunks: self.reset(); return None
             if self.buffers[idx] is None:

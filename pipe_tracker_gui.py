@@ -53,6 +53,9 @@ from pipe_algorithm import MaskProcessor, PipeController, ProcessResult
 # DDS types (inline to avoid path issues when running standalone)
 @dataclass
 class FrameChunk(IdlStruct):
+    # Aligned with tauv-client / tauv-core camera FrameChunk (CDR layout must match).
+    source_id: str
+    feed: str
     timestamp: float
     chunk_buffer: sequence[uint8]
     chunk_id_in_frame: int
@@ -112,9 +115,12 @@ class FrameAssembler:
 
             if self.expected_chunks is None:
                 return None
-            if (int(chunk.total_chunks_in_frame) != self.expected_chunks
-                    or int(chunk.width) != self.width
-                    or int(chunk.height) != self.height):
+            if (
+                int(chunk.total_chunks_in_frame) != self.expected_chunks
+                or int(chunk.width) != self.width
+                or int(chunk.height) != self.height
+                or str(chunk.encoding) != self.encoding
+            ):
                 self.reset()
                 return None
 
@@ -261,7 +267,8 @@ class DDSCommandPublisher:
             command_type="motor_rc",
             command_data=json.dumps(rc),
             timestamp=int(time.time() * 1000),
-        ))
+            client_id="pipe_tracker_gui",
+        ))  
 
 
 # --- Main GUI ---
