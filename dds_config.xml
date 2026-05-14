@@ -6,7 +6,7 @@
         <NetworkInterface name="enp108s0" priority="default" multicast="default"/>
       </Interfaces>
       <AllowMulticast>default</AllowMulticast>
-      <MaxMessageSize>131000B</MaxMessageSize>
+      <MaxMessageSize>8388608B</MaxMessageSize>
       <FragmentSize>32kB</FragmentSize>
     </General>
 

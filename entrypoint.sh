@@ -12,7 +12,7 @@ else
   <Domain id="any">
     <General>
       <AllowMulticast>default</AllowMulticast>
-      <MaxMessageSize>131000B</MaxMessageSize>
+      <MaxMessageSize>8388608B</MaxMessageSize>
       <FragmentSize>32kB</FragmentSize>
     </General>
     <Discovery>

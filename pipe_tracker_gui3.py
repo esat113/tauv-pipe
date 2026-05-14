@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-Pipe Tracker GUI - DDS Tabanli
-Kamera goruntulerini DDS FrameChunk'tan, SAM3 maskesini DDS SegmentationMask'tan alir.
-Algoritma: pipe_algorithm.py (ayni dosya, headless main.py ile ortak)
+Pipe Tracker GUI v3 - DDS Tabanli
+
+v1 ile ayni: RC yaw + forward PWM (`motor_rc`), DDS kamera + SAM3 maske.
+
+Farklar:
+- Yaw PID'e **Kd** eklendi (`PipeControllerFollowPWM`).
+- Sadece **FOLLOW** — baska state yok (coast / viraj / 180 / reacquire yok).
+- Boru sonu **isin taramasi yok** (`MaskProcessor(scan_for_pipe_end=False)`).
 """
 
 import sys
@@ -12,14 +17,8 @@ import json
 import math
 import threading
 from collections import deque
-from pathlib import Path
 
 os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
-_local_dds_config = Path(__file__).resolve().parent / "dds_config.xml"
-if _local_dds_config.exists() and os.environ.get("TAUV_PIPE_USE_ENV_DDS") != "1":
-    os.environ["CYCLONEDDS_URI"] = f"file://{_local_dds_config}"
-elif "CYCLONEDDS_URI" not in os.environ and _local_dds_config.exists():
-    os.environ["CYCLONEDDS_URI"] = f"file://{_local_dds_config}"
 
 # tauv-client'i Python path'e al -- monorepo icinde kardes submodule.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tauv-client", "src"))
@@ -53,7 +52,7 @@ from cyclonedds.idl import IdlStruct
 from cyclonedds.idl.types import sequence, uint8
 from dataclasses import dataclass
 
-from pipe_algorithm import MaskProcessor, PipeController, ProcessResult
+from pipe_algorithm import MaskProcessor, PipeControllerFollowPWM, ProcessResult
 
 
 # DDS types (inline to avoid path issues when running standalone)
@@ -293,7 +292,7 @@ class DDSCommandPublisher:
             command_type="motor_rc",
             command_data=json.dumps(rc),
             timestamp=int(time.time() * 1000),
-            client_id="pipe_tracker_gui",
+            client_id="pipe_tracker_gui3",
         ))  
 
 
@@ -306,6 +305,12 @@ class PipeTrackerWindow(QMainWindow):
         self.tracking = False
         self.last_cmd = {}
 
+        # Maske <-> kamera frame tam eslestirme (son basarili overl'i tut; yanlis fallback yok)
+        self._sync_pair_cache = None  # tuple: (ts_ms, annotated_rgb, bottom_result)
+        self._prev_mask_ts_ms = None
+        self._last_mask_wall_t = None
+        self._mask_fps_ema = 0.0
+
         self._heading_lock = threading.Lock()
         self._heading_deg = 0.0
         self._heading_ok = False
@@ -315,8 +320,9 @@ class PipeTrackerWindow(QMainWindow):
         self.processor = MaskProcessor(
             num_slices=8,
             slice_weights=[0.25, 0.20, 0.16, 0.12, 0.09, 0.07, 0.06, 0.05],
+            scan_for_pipe_end=False,
         )
-        self.controller = PipeController()
+        self.controller = PipeControllerFollowPWM()
 
         self.bottom_cam = DDSCameraReader(participant, "camera/bottom/frame")
         self.bottom_mask_reader = DDSMaskReader(participant, "sam3/bottom/segmentation_mask")
@@ -327,10 +333,9 @@ class PipeTrackerWindow(QMainWindow):
 
         self._init_ui()
 
-        # tauv-client Vehicle ile attitude.yaw -> heading_deg beslemesi.
-        # 180 donus reverse'i ve compute() icin gerekli.
+        # Opsiyonel: sadece heading gostergesi (takip compute heading kullanmaz).
         if Vehicle is None:
-            self._log(f"UYARI: tauv-client import edilemedi ({_vehicle_import_error!r}); heading=0 sabit kalacak, REVERSE state takilir.")
+            self._log(f"UYARI: tauv-client import edilemedi ({_vehicle_import_error!r}); heading gostergesi YOK.")
         else:
             try:
                 self._vehicle = Vehicle()
@@ -340,11 +345,9 @@ class PipeTrackerWindow(QMainWindow):
                 self._vehicle = None
                 self._log(f"UYARI: Vehicle baslatilamadi: {exc}")
 
-        # SAM3 ~10 FPS: kontrol ve maske guncellemesi ~100 ms ile hizali.
-        self._control_period_ms = 100
         self.timer = QTimer()
         self.timer.timeout.connect(self._tick)
-        self.timer.start(self._control_period_ms)
+        self.timer.start(100)
 
     def _heading_loop(self):
         """Vehicle.attitude'u poll ederek heading_deg'i guncelle.
@@ -367,7 +370,7 @@ class PipeTrackerWindow(QMainWindow):
             return self._heading_deg
 
     def _init_ui(self):
-        self.setWindowTitle("Pipe Tracker - DDS (tauv-pipe)")
+        self.setWindowTitle("Pipe Tracker v3 - FOLLOW + Kd, isin yok (tauv-pipe)")
         self.setMinimumSize(1250, 900)
         self.setStyleSheet("""
             QMainWindow { background-color: #1a1a2e; }
@@ -450,36 +453,33 @@ class PipeTrackerWindow(QMainWindow):
         lay.addWidget(sam3_group)
 
         # Tuning
-        tune_group = QGroupBox("Algoritma Tuning")
+        tune_group = QGroupBox("Algoritma Tuning (sadece FOLLOW, PID yaw)")
         tg_lay = QGridLayout(tune_group)
         self.tune_inputs = {}
 
         tune_defs = [
-            ("kp_yaw",                  "Kp Yaw",               "40"),
-            ("ki_yaw",                  "Ki Yaw",               "30"),
-            ("kd_yaw",                  "Kd Yaw",               "10"),
-            ("max_yaw_pwm",             "Max Yaw PWM",          "100"),
-            ("forward_pwm",             "Ileri PWM (duz)",      "130"),
-            ("forward_pwm_curve",       "Ileri PWM (viraj)",    "70"),
-            ("curve_angle_thresh_deg",  "Viraj esigi (deg)",    "20"),
+            ("kp_yaw",      "Kp Yaw",     "150"),
+            ("ki_yaw",      "Ki Yaw",     "200"),
+            ("kd_yaw",      "Kd Yaw",     "0"),
+            ("forward_pwm", "Ileri PWM",  "200"),
+            ("max_yaw_pwm", "Max Yaw PWM", "200"),
+            ("ema_alpha",   "EMA Alpha",  "0.6"),
         ]
 
-        tune_cols = 4
         for i, (key, label, default) in enumerate(tune_defs):
-            row = i // tune_cols
-            col = (i % tune_cols) * 2
-            tg_lay.addWidget(QLabel(label), row, col)
+            row = i // 5
+            col = (i % 5) * 2
+            tg_lay.addWidget(QLabel(label), row * 2, col)
             inp = QLineEdit(default)
-            inp.setMaximumWidth(72)
+            inp.setMaximumWidth(70)
             inp.setStyleSheet("background: #16213e; color: white; border: 1px solid #533483; padding: 3px;")
-            tg_lay.addWidget(inp, row, col + 1)
+            tg_lay.addWidget(inp, row * 2, col + 1)
             self.tune_inputs[key] = inp
 
         self.btn_apply_tune = QPushButton("Uygula")
         self.btn_apply_tune.setStyleSheet("background: #e94560; padding: 6px 20px;")
         self.btn_apply_tune.clicked.connect(self._apply_tune)
-        btn_row = (len(tune_defs) + tune_cols - 1) // tune_cols
-        tg_lay.addWidget(self.btn_apply_tune, btn_row, 0, 1, 4)
+        tg_lay.addWidget(self.btn_apply_tune, 2, 8, 1, 2)
         lay.addWidget(tune_group)
 
         # Log
@@ -518,14 +518,23 @@ class PipeTrackerWindow(QMainWindow):
                 kp_yaw=float(s["kp_yaw"].text()),
                 ki_yaw=float(s["ki_yaw"].text()),
                 kd_yaw=float(s["kd_yaw"].text()),
-                max_yaw_pwm=int(s["max_yaw_pwm"].text()),
                 forward_pwm=int(s["forward_pwm"].text()),
-                forward_pwm_curve=int(s["forward_pwm_curve"].text()),
-                curve_angle_thresh_deg=float(s["curve_angle_thresh_deg"].text()),
+                max_yaw_pwm=int(s["max_yaw_pwm"].text()),
+                ema_alpha=float(s["ema_alpha"].text()),
             )
             self._log("Tuning uygulandi")
         except ValueError as e:
             self._log(f"Tuning hatasi: {e}")
+
+    @staticmethod
+    def _normalize_frame_ts_ms(ts: float) -> float:
+        """FrameChunk Jetson'da ms; eski bridge saniye yazmissa saniye kabul et."""
+        if ts <= 0:
+            return ts
+        t = float(ts)
+        if t < 1e11:
+            return t * 1000.0
+        return t
 
     def _overlay_mask(self, frame, raw_mask):
         """Kamera frame uzerine SAM3 maskesini yesil overlay olarak ciz."""
@@ -535,11 +544,7 @@ class PipeTrackerWindow(QMainWindow):
             binary = cv2.resize(raw_mask, (w_cam, h_cam), interpolation=cv2.INTER_NEAREST)
         else:
             binary = raw_mask.copy()
-        binary = binary.astype(np.uint8)
-        if binary.size and int(binary.max()) <= 1:
-            binary = (binary > 0).astype(np.uint8) * 255
-        else:
-            _, binary = cv2.threshold(binary, 128, 255, cv2.THRESH_BINARY)
+        _, binary = cv2.threshold(binary, 128, 255, cv2.THRESH_BINARY)
         annotated = frame.copy()
         overlay = annotated.copy()
         overlay[binary > 0] = [0, 255, 0]
@@ -547,7 +552,7 @@ class PipeTrackerWindow(QMainWindow):
         return annotated, binary
 
     def _tick(self):
-        # Heading label (istege bagli izleme).
+        # Heading gostergesi (opsiyonel)
         with self._heading_lock:
             hdg_now = self._heading_deg
             hdg_ok = self._heading_ok
@@ -558,24 +563,45 @@ class PipeTrackerWindow(QMainWindow):
             self.heading_label.setText("hdg=YOK")
             self.heading_label.setStyleSheet("color: #c62828; font-size: 13px; font-weight: bold;")
 
-        # Mask-driven senkron overlay: SAM3 mask'i timestamp tasiyor (kaynak
-        # frame'in zamani). O frame'i camera buffer'indan al, ikisini overlay
-        # et -- bu sayede live frame + late mask lag'i ortadan kalkar.
+        # Maske DDS timestamp = kaynak karenin ms zaman damgasi (SAM3 bridge meta.timestamp).
+        # Eslestirilemezse canli kamera+mask karistirmayi birak; son dogru cifti goster.
         bottom_result = None
         sample = self.bottom_mask_reader.get_mask_with_meta()
 
         if sample is not None:
-            bottom_mask, mask_ts = sample
-            bottom = self.bottom_cam.get_frame_at(mask_ts, max_age_ms=2000.0)
-            if bottom is None:
-                # Buffer'da yeterince eski frame yok (ornegin GUI yeni acildi)
-                # -- en son frame'le fallback yap.
-                bottom = self.bottom_cam.get_frame()
+            bottom_mask, mask_ts_raw = sample
+            mask_ts_ms = self._normalize_frame_ts_ms(mask_ts_raw)
+            bottom = self.bottom_cam.get_frame_at(mask_ts_ms, max_age_ms=400.0)
             if bottom is not None:
                 annotated_bottom, binary = self._overlay_mask(bottom, bottom_mask)
                 bottom_result = self.processor.process(binary)
                 self._draw_slices(annotated_bottom, bottom_result)
                 self._show(self.bottom_view, annotated_bottom)
+                try:
+                    ann_copy = annotated_bottom.copy()
+                except Exception:
+                    ann_copy = annotated_bottom
+                self._sync_pair_cache = (mask_ts_ms, ann_copy, bottom_result)
+
+                wall = time.monotonic()
+                if (
+                    self._prev_mask_ts_ms is not None
+                    and mask_ts_ms != self._prev_mask_ts_ms
+                    and self._last_mask_wall_t is not None
+                ):
+                    dt = wall - self._last_mask_wall_t
+                    if dt > 1e-6:
+                        inst_fps = 1.0 / dt
+                        if self._mask_fps_ema <= 0:
+                            self._mask_fps_ema = inst_fps
+                        else:
+                            self._mask_fps_ema = 0.15 * inst_fps + 0.85 * self._mask_fps_ema
+                self._last_mask_wall_t = wall
+                self._prev_mask_ts_ms = mask_ts_ms
+            elif self._sync_pair_cache is not None:
+                _, ann_cached, res_cached = self._sync_pair_cache
+                self._show(self.bottom_view, ann_cached)
+                bottom_result = res_cached
         else:
             bottom = self.bottom_cam.get_frame()
             if bottom is not None:
@@ -590,13 +616,14 @@ class PipeTrackerWindow(QMainWindow):
         self.state_label.setText(st)
 
         info_parts = []
-        if st == PipeController.STATE_FOLLOW and bottom_result and bottom_result.error is not None:
+        if bottom_result and bottom_result.error is not None:
             info_parts.append(f"err={bottom_result.error:+.2f}")
             info_parts.append(f"ang={bottom_result.pipe_angle_deg:+.0f}")
-            cont = "DEVAM" if bottom_result.pipe_continues else "SON"
-            info_parts.append(f"scan={bottom_result.scan_hit_count}({cont})")
+            info_parts.append(f"curv={bottom_result.curvature:+.2f}")
         else:
             info_parts.append("boru yok")
+        mfps = self._mask_fps_ema if self._mask_fps_ema > 0 else 0.0
+        info_parts.append(f"mask_fps={mfps:.1f}")
         info_parts.append(f"CMD yaw={cmd['yaw']} fwd={cmd['forward']}")
         self.info_label.setText("  |  ".join(info_parts))
 
@@ -649,16 +676,14 @@ class PipeTrackerWindow(QMainWindow):
             cv2.line(bgr, (x1, y1), (x2, y2), color, 1)
             cv2.circle(bgr, (x2, y2), 3, color, -1)
 
-        cont_str = "DEVAM" if result.pipe_continues else "SON"
-        cont_color = GREEN if result.pipe_continues else RED
         cv2.putText(bgr, f"err={result.error:+.2f}", (5, 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, GREEN, 1)
         cv2.putText(bgr, f"angle={result.pipe_angle_deg:+.0f}", (5, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, MAGENTA, 1)
         cv2.putText(bgr, f"curv={result.curvature:+.2f}", (5, 45),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, YELLOW, 1)
-        cv2.putText(bgr, f"scan={result.scan_hit_count} {cont_str}", (5, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, cont_color, 1)
+        cv2.putText(bgr, "v3 FOLLOW (isin/boru sonu yok)", (5, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, CYAN, 1)
 
         rgb_back = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         frame[:] = rgb_back
@@ -674,12 +699,16 @@ class PipeTrackerWindow(QMainWindow):
 
     def on_start(self):
         self.controller.reset()
+        self._sync_pair_cache = None
+        self._prev_mask_ts_ms = None
+        self._last_mask_wall_t = None
+        self._mask_fps_ema = 0.0
         self.tracking = True
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.state_label.setText(PipeController.STATE_NO_PIPE)
+        self.state_label.setText("FOLLOW")
         self.state_label.setStyleSheet("color: #e94560; font-size: 20px; font-weight: bold;")
-        self._log("Takip baslatildi (DDS kamera + SAM3 mask)")
+        self._log("Takip baslatildi (v3: FOLLOW + Kd, isin/boru sonu yok)")
 
     def on_stop(self):
         self.tracking = False
@@ -705,17 +734,17 @@ class PipeTrackerWindow(QMainWindow):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Pipe Tracker GUI (DDS)")
+    parser = argparse.ArgumentParser(description="Pipe Tracker GUI v3 (DDS)")
     parser.add_argument("--domain-id", type=int, default=0, help="DDS domain ID")
     args = parser.parse_args()
 
     print("=" * 60)
-    print("PIPE TRACKER GUI - DDS (tauv-pipe)")
+    print("PIPE TRACKER GUI v3 - DDS (tauv-pipe)")
     print("=" * 60)
     print("Kamera: DDS FrameChunk (camera/bottom/frame, MJPEG)")
     print("Maske : DDS SegmentationMask (sam3/bottom/segmentation_mask)")
-    print("Komut : DDS StreamCommand (embedded/control/stream_command)")
-    print("Algo  : pipe_algorithm.py (SAM3 ~10 FPS ile uyumlu kontrol ~100 ms)")
+    print("Komut : motor_rc (PipeControllerFollowPWM: Kp Ki Kd yaw + forward)")
+    print("Mod   : sadece FOLLOW — boru sonu isin taramasi kapali")
     print("=" * 60)
 
     participant = DomainParticipant(domain_id=args.domain_id)

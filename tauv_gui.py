@@ -228,6 +228,8 @@ class DDSMaskReader:
         self._mask = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._warn_payload_mismatch = 0
+        self._warn_parse = 0
 
     def start(self):
         self._stop.clear()
@@ -241,12 +243,30 @@ class DDSMaskReader:
             try:
                 samples = self._reader.take(32)
                 for sample in samples:
-                    raw = np.frombuffer(bytes(sample.mask_data), dtype=np.uint8)
-                    mask = raw.reshape(sample.height, sample.width)
+                    w = int(sample.width)
+                    h = int(sample.height)
+                    if w <= 0 or h <= 0:
+                        continue
+                    payload = bytes(sample.mask_data)
+                    raw = np.frombuffer(payload, dtype=np.uint8)
+                    expected = w * h
+                    if raw.size != expected:
+                        if self._warn_payload_mismatch < 6:
+                            print(
+                                f"[DDSMaskReader] mask_data uzunluk uyumsuz: "
+                                f"got={raw.size} beklenen={expected} ({w}x{h}) "
+                                f"(CycloneDDS MaxMessageSize artırın)",
+                                flush=True,
+                            )
+                            self._warn_payload_mismatch += 1
+                        continue
+                    mask = raw.reshape((h, w)).copy()
                     with self._lock:
                         self._mask = mask
-            except Exception:
-                pass
+            except Exception as exc:
+                if self._warn_parse < 6:
+                    print(f"[DDSMaskReader] örnek işleme hatası: {exc}", flush=True)
+                    self._warn_parse += 1
             time.sleep(0.005)
 
     def get_mask(self):

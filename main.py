@@ -38,12 +38,10 @@ def set_sam3_prompt(api_url: str, prompt: str):
 def main():
     cfg = load_config()
     print("=== tauv-pipe: Boru Takip Baslatiliyor ===")
-    print(f"  forward_pwm    : {cfg.get('forward_pwm', 200)}")
-    print(f"  max_yaw_pwm    : {cfg.get('max_yaw_pwm', 200)}")
-    print(f"  kp_yaw         : {cfg.get('kp_yaw', 150.0)}")
-    print(f"  ki_yaw         : {cfg.get('ki_yaw', 200.0)}")
-    print(f"  num_slices     : {cfg.get('num_slices', 8)}")
-    print(f"  ema_alpha      : {cfg.get('ema_alpha', 0.6)}")
+    print(f"  kp_yaw / ki / kd : {cfg.get('kp_yaw', 40.0)} / {cfg.get('ki_yaw', 30.0)} / {cfg.get('kd_yaw', 10.0)}")
+    print(f"  max_yaw_pwm      : {cfg.get('max_yaw_pwm', 100)}")
+    print(f"  forward duz/viraj: {cfg.get('forward_pwm', 130)} / {cfg.get('forward_pwm_curve', 70)} (>{cfg.get('curve_angle_thresh_deg', 20.0)} deg)")
+    print(f"  num_slices       : {cfg.get('num_slices', 8)}")
     print()
 
     participant = DomainParticipant(domain_id=cfg.get("dds_domain", 0))
@@ -62,20 +60,13 @@ def main():
 
     controller = PipeController(
         neutral_pwm=cfg.get("neutral_pwm", 1500),
-        forward_pwm=cfg.get("forward_pwm", 200),
-        max_yaw_pwm=cfg.get("max_yaw_pwm", 200),
-        kp_yaw=cfg.get("kp_yaw", 150.0),
-        ki_yaw=cfg.get("ki_yaw", 200.0),
-        ema_alpha=cfg.get("ema_alpha", 0.6),
-        turn_curvature_thresh=cfg.get("turn_curvature_thresh", 0.03),
-        turn_align_thresh_deg=cfg.get("turn_align_thresh_deg", 10.0),
-        turn_forward_pwm=cfg.get("turn_forward_pwm", 150),
-        turn_yaw_boost=cfg.get("turn_yaw_boost", 3.0),
-        coast_timeout=cfg.get("coast_timeout", 1.5),
-        coast_yaw_decay=cfg.get("coast_yaw_decay", 0.55),
-        reverse_yaw_pwm=cfg.get("reverse_yaw_pwm", 150),
-        reacquire_forward_pwm=cfg.get("reacquire_forward_pwm", 100),
-        reacquire_duration_s=cfg.get("reacquire_duration_s", 5.0),
+        kp_yaw=cfg.get("kp_yaw", 40.0),
+        ki_yaw=cfg.get("ki_yaw", 30.0),
+        kd_yaw=cfg.get("kd_yaw", 10.0),
+        max_yaw_pwm=cfg.get("max_yaw_pwm", 100),
+        forward_pwm=cfg.get("forward_pwm", 130),
+        forward_pwm_curve=cfg.get("forward_pwm_curve", 70),
+        curve_angle_thresh_deg=cfg.get("curve_angle_thresh_deg", 20.0),
     )
 
     shutdown = False
