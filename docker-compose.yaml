@@ -5,9 +5,11 @@ services:
     network_mode: host
     restart: unless-stopped
     environment:
-      - JETSON_IP=${JETSON_IP:-192.168.1.100}
-      - PC_IP=${PC_IP:-192.168.1.101}
-      - DDS_INTERFACE=${DDS_INTERFACE:-enp3s0}
+      # Sim defaults are loopback. For the real vehicle, override these in .env:
+      # DDS_INTERFACE=enp108s0, JETSON_IP=192.168.1.100, PC_IP=192.168.1.101
+      - JETSON_IP=${JETSON_IP:-localhost}
+      - PC_IP=${PC_IP:-localhost}
+      - DDS_INTERFACE=${DDS_INTERFACE:-lo}
       - PYTHONUNBUFFERED=1
     volumes:
       - ./config.yaml:/app/config.yaml:ro

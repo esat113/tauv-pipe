@@ -19,19 +19,48 @@ from collections import deque
 from dataclasses import dataclass
 
 os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
+_workspace_root = Path(__file__).resolve().parent.parent
+_workspace_cyclonedds = _workspace_root / ".tauv" / "cyclonedds"
+_workspace_dds_lib = _workspace_cyclonedds / "lib" / "libddsc.so"
+_configured_cyclonedds = Path(os.environ.get("CYCLONEDDS_HOME", "")) if os.environ.get("CYCLONEDDS_HOME") else None
+_configured_dds_lib = (
+    _configured_cyclonedds / "lib" / "libddsc.so"
+    if _configured_cyclonedds is not None
+    else None
+)
+if _workspace_dds_lib.exists() and (_configured_dds_lib is None or not _configured_dds_lib.exists()):
+    os.environ["CYCLONEDDS_HOME"] = str(_workspace_cyclonedds)
+    _dds_lib_dir = str(_workspace_cyclonedds / "lib")
+    _ld_paths = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(":") if p]
+    if _dds_lib_dir not in _ld_paths:
+        os.environ["LD_LIBRARY_PATH"] = ":".join([_dds_lib_dir, *_ld_paths])
+
 _local_dds_config = Path(__file__).resolve().parent / "dds_config.xml"
 if _local_dds_config.exists() and os.environ.get("TAUV_PIPE_USE_ENV_DDS") != "1":
     os.environ["CYCLONEDDS_URI"] = f"file://{_local_dds_config}"
 elif "CYCLONEDDS_URI" not in os.environ and _local_dds_config.exists():
     os.environ["CYCLONEDDS_URI"] = f"file://{_local_dds_config}"
 
-_tauv_client_src = Path(__file__).resolve().parent.parent / "tauv-client" / "src"
+_tauv_client_src = _workspace_root / "tauv-client" / "src"
 if _tauv_client_src.exists():
     sys.path.insert(0, str(_tauv_client_src))
 
 import cv2
 import numpy as np
 import requests
+
+# opencv-python ships its own Qt plugin bundle and sets Qt's plugin path to
+# cv2/qt/plugins on import. This breaks PyQt5's xcb plugin on the host GUI.
+try:
+    import PyQt5
+
+    _pyqt_plugins = Path(PyQt5.__file__).resolve().parent / "Qt5" / "plugins"
+    if _pyqt_plugins.exists():
+        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(_pyqt_plugins)
+    os.environ.pop("QT_QPA_FONTDIR", None)
+except Exception:
+    os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
+    os.environ.pop("QT_QPA_FONTDIR", None)
 
 try:
     from tauv_client import Vehicle

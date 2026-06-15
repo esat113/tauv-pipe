@@ -3,7 +3,10 @@
   <Domain id="any">
     <General>
       <Interfaces>
+        <NetworkInterface name="lo" priority="default" multicast="default"/>
+        <!-- Real vehicle example:
         <NetworkInterface name="enp108s0" priority="default" multicast="default"/>
+        -->
       </Interfaces>
       <AllowMulticast>default</AllowMulticast>
       <MaxMessageSize>8388608B</MaxMessageSize>
@@ -11,9 +14,14 @@
     </General>
 
     <Discovery>
+      <ParticipantIndex>auto</ParticipantIndex>
+      <MaxAutoParticipantIndex>120</MaxAutoParticipantIndex>
       <Peers>
+        <Peer Address="localhost"/>
+        <!-- Real vehicle peers:
         <Peer Address="192.168.1.100"/>
         <Peer Address="192.168.1.101"/>
+        -->
       </Peers>
     </Discovery>
   </Domain>
